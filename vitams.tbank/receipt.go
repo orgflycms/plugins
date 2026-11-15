@@ -51,6 +51,9 @@ func receipt(p *sdk.Payment) (map[string]any, error) {
 	if email == "" && phone == "" {
 		return nil, errors.New("Для чека нужны почта или телефон, а в заказе их нет — свяжитесь с магазином, пожалуйста")
 	}
+	// Формат банк при Init не сверяет (проба на тестовом терминале
+	// 2026-11-15: чек принят и с FfdVersion, и без, и с MeasurementUnit, и
+	// без) — его проверяет касса, когда пробивает чек после списания.
 	ffd12 := p.Settings["ffd"] == "ФФД 1.2"
 	if ffd12 {
 		out["FfdVersion"] = "1.2"

@@ -53,7 +53,9 @@ func Init(api sdk.API) error {
 // Остальное (CONFIRMED, возвраты, незнакомые слова) — деньги были или
 // будут, нового платежа не надо.
 var (
-	alive = map[string]bool{"NEW": true, "FORMSHOWED": true, "AUTHORIZING": true, "3DS_CHECKING": true,
+	// Открытую форму настоящий банк называет FORM_SHOWED (с подчёркиванием);
+	// FORMSHOWED — написание из старых описаний, оставлено на всякий случай.
+	alive = map[string]bool{"NEW": true, "FORM_SHOWED": true, "FORMSHOWED": true, "AUTHORIZING": true, "3DS_CHECKING": true,
 		"3DS_CHECKED": true, "AUTHORIZED": true, "CONFIRMING": true}
 	dead = map[string]bool{"REJECTED": true, "AUTH_FAIL": true, "CANCELED": true, "DEADLINE_EXPIRED": true,
 		"REVERSED": true, "ATTEMPTS_EXPIRED": true}
@@ -101,7 +103,7 @@ func start(ctx context.Context, p *sdk.Payment) (sdk.PayStart, error) {
 		}
 		// Номер заказа у банка в терминале не повторяется — у новой
 		// попытки он свой.
-		orderID += "-" + strconv.FormatInt(time.Now().Unix(), 10)
+		orderID = retryID(p.ID)
 	}
 
 	body := map[string]any{
@@ -125,6 +127,14 @@ func start(ctx context.Context, p *sdk.Payment) (sdk.PayStart, error) {
 		body["Receipt"] = r
 	}
 	res, err := call(ctx, p.Settings, "Init", body)
+	if err != nil && text(res, "ErrorCode") == "8" && orderID == strconv.FormatInt(p.ID, 10) {
+		// «Заказ с таким order_id уже существует»: номер оплаты в этом
+		// терминале уже занят — магазин переустановили, терминал достался от
+		// прежнего сайта или прошлый ответ банка потерялся. Платёж под
+		// старым номером покупателю не показан, поэтому создаём свой.
+		body["OrderId"] = retryID(p.ID)
+		res, err = call(ctx, p.Settings, "Init", body)
+	}
 	if err != nil {
 		return sdk.PayStart{}, errors.New("Банк не принял платёж (" + err.Error() + ") — попробуйте ещё раз или свяжитесь с магазином")
 	}
@@ -135,6 +145,15 @@ func start(ctx context.Context, p *sdk.Payment) (sdk.PayStart, error) {
 		return out, errors.New("Банк не выдал платёжную форму — попробуйте ещё раз или свяжитесь с магазином")
 	}
 	return out, nil
+}
+
+// retryID — номер заказа для банка, когда простой номер оплаты занят или
+// его платёж умер: в терминале номер не повторяется. Время — в
+// миллисекундах: две попытки одной оплаты в одну секунду (занятый номер,
+// затем отказ) с секундами получили бы один номер. Длина — не больше 33
+// знаков при пределе банка 36.
+func retryID(id int64) string {
+	return strconv.FormatInt(id, 10) + "-" + strconv.FormatInt(time.Now().UnixMilli(), 10)
 }
 
 // notify — уведомление банка на адрес способа. Сначала подпись: без неё
