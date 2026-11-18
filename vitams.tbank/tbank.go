@@ -36,6 +36,9 @@ var fields = []sdk.Field{
 }
 
 func Init(api sdk.API) error {
+	if err := initBankClients(); err != nil {
+		return err
+	}
 	api.RegisterPayment("card", sdk.PaymentHandler{
 		Title:    "Т-Банк: карта и СБП",
 		Button:   "Оплатить картой или СБП",

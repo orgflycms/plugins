@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -113,13 +112,7 @@ func call(ctx context.Context, settings map[string]string, method string, body m
 	if base == "" {
 		base = defaultAPI
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/"+method, bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{}
-	res, err := client.Do(req)
+	res, err := postBank(ctx, base+"/"+method, data)
 	if err != nil {
 		return nil, errors.New("банк недоступен")
 	}
