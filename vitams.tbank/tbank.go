@@ -179,30 +179,67 @@ func notify(ctx context.Context, n *sdk.Notice) (sdk.PayEvent, error) {
 	if e.ExternalID == "" {
 		return sdk.PayEvent{}, errors.New("в уведомлении нет номера платежа")
 	}
-	// Банк шлёт уведомления не по порядку: AUTHORIZED приходит через
-	// миллисекунды после CONFIRMED. Ядро по контракту принимает любое слово
-	// о платеже, а где оно в жизненном цикле — знает только банк и его
-	// GetState (своей базы у плагина нет), поэтому о «живом» слове
-	// спрашиваем, не ушёл ли платёж дальше.
-	if alive[e.ExternalStatus] {
-		e = latest(ctx, n.Settings, e)
+	// Банк шлёт уведомления не по порядку (при одностадийной оплате
+	// AUTHORIZED и CONFIRMED уходят разом): ядро по контракту принимает
+	// любое слово, а порядок слов знает только плагин и банк. Поэтому о
+	// слове, за которым в жизненном цикле что-то ещё бывает, спрашиваем
+	// банк: состояние платежа сейчас — не раньше любого его уведомления.
+	if r := rank[e.ExternalStatus]; r > 0 && r < rankFinal {
+		return latest(ctx, n.Settings, e)
 	}
 	return e, nil
 }
 
-// latest — событие по нынешнему состоянию платежа, если оно уже итоговое
-// (CONFIRMED, возврат, отказ); иначе — слово из уведомления. Банк не
-// ответил — тоже оно: уведомление нельзя терять, а оплату догонит опрос.
-func latest(ctx context.Context, settings map[string]string, e sdk.PayEvent) sdk.PayEvent {
+// rank — место слова в жизненном цикле платежа по справочнику статусов
+// Т-Банка (developer.tbank.ru/eacq/intro/developer/operation-statuses).
+// Больше — позже. Слова вне таблицы (новые у банка) ранга не имеют: их
+// ядро принимает как раньше, без вопроса банку.
+var rank = map[string]int{
+	"NEW": 1, "FORM_SHOWED": 1, "FORMSHOWED": 1, "3DS_CHECKING": 1, "3DS_CHECKED": 1,
+	"AUTHORIZING": 1, "PREAUTHORIZING": 1, "PAY_CHECKING": 1,
+	"AUTHORIZED":       2,
+	"CONFIRM_CHECKING": 3, "CONFIRMING": 3,
+	"CONFIRMED": 4,
+	"REVERSING": 5, "PARTIAL_REVERSED": 5, "REFUNDING": 5, "ASYNC_REFUNDING": 5, "PARTIAL_REFUNDED": 5,
+	// Итоговые: после них ничего не бывает, спрашивать не о чем.
+	"REFUNDED": rankFinal, "REVERSED": rankFinal, "REJECTED": rankFinal, "AUTH_FAIL": rankFinal,
+	"CANCELED": rankFinal, "DEADLINE_EXPIRED": rankFinal, "ATTEMPTS_EXPIRED": rankFinal,
+}
+
+const rankFinal = 6
+
+// latest — событие с учётом нынешнего состояния платежа у банка. Состояние
+// позже слова из уведомления — берём его (запоздавшее AUTHORIZED после
+// CONFIRMED, CONFIRMED после REFUNDED); не позже — слово из уведомления.
+// Банк не ответил: ошибка — ядро ответит банку 400, и он повторит
+// уведомление (раз в час сутки, потом раз в сутки месяц), иначе запоздавшее
+// слово затёрло бы оплаченное, а опрос оплат в статусе paid не спрашивает.
+// Исключение — CONFIRMED: деньги списаны, оплату надо отметить сразу, а не
+// ждать банк; если за ним уже был возврат, слово исправит повтор или владелец.
+func latest(ctx context.Context, settings map[string]string, e sdk.PayEvent) (sdk.PayEvent, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	state, err := call(ctx, settings, "GetState", map[string]any{"PaymentId": e.ExternalID})
-	if st := text(state, "Status"); err != nil || st == "" || alive[st] {
-		return e
+	if err != nil {
+		if e.Status == sdk.PayPaid {
+			return e, nil
+		}
+		return sdk.PayEvent{}, errors.New("Т-Банк не сообщил состояние платежа " + e.ExternalID + ": " + err.Error())
+	}
+	word := text(state, "Status")
+	if rank[word] <= rank[e.ExternalStatus] {
+		return e, nil
+	}
+	if e.Status == sdk.PayPaid {
+		// Списание было, платёж оплачен; слово — что с ним стало потом
+		// (возврат), сумма — из уведомления о списании.
+		e.ExternalStatus = word
+		return e, nil
 	}
 	now := event(state)
-	now.ExternalID, now.Reply = e.ExternalID, e.Reply
-	return now
+	now.ExternalID = e.ExternalID
+	now.Reply = e.Reply
+	return now, nil
 }
 
 // check — спросить банк о платеже: уведомление могло потеряться, пока
@@ -214,6 +251,7 @@ func check(ctx context.Context, p *sdk.Payment) (sdk.PayEvent, error) {
 			". Проверьте ключ и пароль терминала в настройках способа оплаты")
 	}
 	e := event(state)
-	e.ExternalID, e.Reply = p.ExternalID, ""
+	e.ExternalID = p.ExternalID
+	e.Reply = ""
 	return e, nil
 }
