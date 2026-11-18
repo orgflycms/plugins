@@ -179,7 +179,30 @@ func notify(ctx context.Context, n *sdk.Notice) (sdk.PayEvent, error) {
 	if e.ExternalID == "" {
 		return sdk.PayEvent{}, errors.New("в уведомлении нет номера платежа")
 	}
+	// Банк шлёт уведомления не по порядку: AUTHORIZED приходит через
+	// миллисекунды после CONFIRMED. Ядро по контракту принимает любое слово
+	// о платеже, а где оно в жизненном цикле — знает только банк и его
+	// GetState (своей базы у плагина нет), поэтому о «живом» слове
+	// спрашиваем, не ушёл ли платёж дальше.
+	if alive[e.ExternalStatus] {
+		e = latest(ctx, n.Settings, e)
+	}
 	return e, nil
+}
+
+// latest — событие по нынешнему состоянию платежа, если оно уже итоговое
+// (CONFIRMED, возврат, отказ); иначе — слово из уведомления. Банк не
+// ответил — тоже оно: уведомление нельзя терять, а оплату догонит опрос.
+func latest(ctx context.Context, settings map[string]string, e sdk.PayEvent) sdk.PayEvent {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	state, err := call(ctx, settings, "GetState", map[string]any{"PaymentId": e.ExternalID})
+	if st := text(state, "Status"); err != nil || st == "" || alive[st] {
+		return e
+	}
+	now := event(state)
+	now.ExternalID, now.Reply = e.ExternalID, e.Reply
+	return now
 }
 
 // check — спросить банк о платеже: уведомление могло потеряться, пока
