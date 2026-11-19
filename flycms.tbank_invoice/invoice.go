@@ -31,7 +31,7 @@ const (
 )
 
 // vatOptions — подписи ставок для владельца; vatCode переводит их в
-// значения API счетов. Ставки — на 2026 год, как в vitams.invoice.
+// значения API счетов. Ставки — на 2026 год, как в flycms.invoice.
 var vatOptions = []string{"Без НДС", "НДС 0%", "НДС 5%", "НДС 7%", "НДС 10%", "НДС 22%"}
 
 func vatCode(label string) string {
@@ -193,7 +193,7 @@ func setting(p *sdk.Payment, key, fallback string) string {
 }
 
 // invoiceRequest — тело запроса на счёт. Номер и дата счёта — от заказа,
-// как у vitams.invoice: покупатель видит один номер в магазине и в банке.
+// как у flycms.invoice: покупатель видит один номер в магазине и в банке.
 func invoiceRequest(p *sdk.Payment, account, inn string) map[string]any {
 	days := defaultDueDays
 	if n, err := strconv.Atoi(setting(p, "due_days", "")); err == nil && n > 0 {
