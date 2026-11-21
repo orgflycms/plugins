@@ -80,9 +80,14 @@ func token(ctx context.Context, s map[string]string) (string, error) {
 	if code >= 400 || t == "" {
 		return "", errors.New("СДЭК не принял идентификатор или пароль")
 	}
-	sec := 3600.0
+	// Нет срока или он крошечный — кеш на 5 минут, не на час: протухший
+	// токен иначе ходил бы с 401 до каждого запроса. Сверху — час.
+	sec := 300.0
 	if n, ok := asFloat(v["expires_in"]); ok && n > 120 {
 		sec = n
+	}
+	if sec > 3600 {
+		sec = 3600
 	}
 	tokMu.Lock()
 	slot = tokenSlot{base: base, account: account, token: t, until: time.Now().Add(time.Duration(sec-60) * time.Second)}

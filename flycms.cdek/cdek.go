@@ -55,8 +55,26 @@ func fields() []sdk.Field {
 		{Key: "sender_name", Label: "Отправитель", Required: true, Hint: "Имя в заказе СДЭК."},
 		{Key: "sender_phone", Label: "Телефон отправителя", Required: true},
 		{Key: "on_status", Label: "Создавать заказ при статусе",
-			Hint: "Код статуса магазина. Пусто — когда заказ оплачен."},
+			Hint: "Код статуса, в который переходит заказ (например, done). «new» — сразу при оформлении. Пусто — когда заказ оплачен."},
 	}
+}
+
+// validateSettings — пустой черновик можно сохранить (способ ещё не готов,
+// покупатель его не видит). Как только заполняют хоть что-то, без
+// идентификатора, пароля и отправителя с телефоном форма не сохраняется.
+func validateSettings(_ context.Context, s map[string]string) error {
+	if s == nil || (strings.TrimSpace(s["account"]) == "" && s["secure"] == "" &&
+		strings.TrimSpace(s["sender_name"]) == "" && strings.TrimSpace(s["sender_phone"]) == "" &&
+		strings.TrimSpace(s["from_city"]) == "") {
+		return nil
+	}
+	if strings.TrimSpace(s["account"]) == "" || s["secure"] == "" {
+		return errors.New("Укажите идентификатор и пароль СДЭК")
+	}
+	if strings.TrimSpace(s["sender_name"]) == "" || normalizePhone(s["sender_phone"]) == "" {
+		return errors.New("Укажите отправителя и телефон, по которому СДЭК примет заказ")
+	}
+	return nil
 }
 
 func Init(api sdk.API) error {
@@ -66,19 +84,27 @@ func Init(api sdk.API) error {
 		order_id    bigint primary key,
 		uuid        text not null default '',
 		cdek_number text not null default '',
-		error       text not null default ''
+		error       text not null default '',
+		claimed_at  timestamptz
 	)`); err != nil {
+		return err
+	}
+	// Таблица первой версии была без claimed_at: колонка нужна, чтобы два
+	// процесса не создали два отправления на один заказ.
+	if err := db.Exec(context.Background(), `alter table cdek_orders add column if not exists claimed_at timestamptz`); err != nil {
 		return err
 	}
 	api.Menu("СДЭК", "/")
 	api.Handle("GET /{$}", func(w http.ResponseWriter, r *http.Request) { page(api, w, r) })
 	api.RegisterDelivery("door", sdk.DeliveryHandler{
-		Title: "СДЭК: курьер до двери", Settings: fields(), Quote: func(ctx context.Context, r *sdk.DeliveryRequest) (sdk.DeliveryQuote, error) {
+		Title: "СДЭК: курьер до двери", Settings: fields(), Validate: validateSettings,
+		Quote: func(ctx context.Context, r *sdk.DeliveryRequest) (sdk.DeliveryQuote, error) {
 			return quote(ctx, r, tariffDoor, false)
 		},
 	})
 	api.RegisterDelivery("point", sdk.DeliveryHandler{
-		Title: "СДЭК: до пункта выдачи", Settings: fields(), Quote: func(ctx context.Context, r *sdk.DeliveryRequest) (sdk.DeliveryQuote, error) {
+		Title: "СДЭК: до пункта выдачи", Settings: fields(), Validate: validateSettings,
+		Quote: func(ctx context.Context, r *sdk.DeliveryRequest) (sdk.DeliveryQuote, error) {
 			return quote(ctx, r, tariffPoint, true)
 		},
 	})
@@ -108,11 +134,8 @@ func quote(ctx context.Context, r *sdk.DeliveryRequest, defTariff int, point boo
 		}
 		return sdk.DeliveryQuote{}, err
 	}
-	if code := strings.TrimSpace(r.Place.Code); code != "" && !strings.Contains(code, "-") {
-		if n, conv := strconv.Atoi(code); conv == nil && n > 0 {
-			to = n
-		}
-	}
+	// Place.Code — код магазина (ФИАС, КЛАДР, ISO), не код города СДЭК.
+	// И расчёт, и заказ берут город одним резолвером по названию.
 	if point && strings.TrimSpace(r.PickupPoint) == "" {
 		return sdk.DeliveryQuote{Missing: pointHint(ctx, s, to)}, nil
 	}
@@ -130,18 +153,17 @@ func quote(ctx context.Context, r *sdk.DeliveryRequest, defTariff int, point boo
 	m := obj(v)
 	sum, ok := asFloat(m["total_sum"])
 	if !ok || code >= 400 {
-		// total_sum — с услугами и НДС: это сумма, которую выставит СДЭК.
-		// delivery_sum её не содержит.
-		if alt, ok2 := asFloat(m["delivery_sum"]); ok2 && code < 400 {
-			sum, ok = alt, true
-		}
-	}
-	if !ok || code >= 400 {
+		// total_sum — с услугами и НДС, её и платит покупатель. delivery_sum
+		// её не содержит: подставлять её молча — значит занизить цену.
 		msg := cdekMessage(v)
 		if msg == "" {
-			msg = "код " + strconv.Itoa(code)
+			msg = "в ответе нет total_sum, код " + strconv.Itoa(code)
 		}
 		return sdk.DeliveryQuote{}, errors.New("СДЭК не рассчитал доставку: " + msg)
+	}
+	cur, _ := m["currency"].(string)
+	if cur != "RUB" {
+		return sdk.DeliveryQuote{}, errors.New("СДЭК посчитал доставку не в рублях (" + cur + ")")
 	}
 	kop := int64(math.Round(sum * 100))
 	minD, _ := asInt(m["period_min"])
@@ -328,6 +350,22 @@ func cm(mm int) int {
 	return c
 }
 
+// permanentMark — отказ, который повтор события не исправит: неверный
+// телефон, INVALID, пустые настройки. Такой ответ нельзя вернуть ядру
+// ошибкой: курсор останется на этом заказе и следующие не уйдут в СДЭК
+// до 72 часов. Префикс снимается перед записью в cdek_orders.error.
+const permanentMark = "cdek-permanent\x00"
+
+func permanent(msg string) error { return errors.New(permanentMark + msg) }
+
+func isPermanent(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), permanentMark)
+}
+
+func permanentText(err error) string {
+	return strings.TrimPrefix(err.Error(), permanentMark)
+}
+
 func onOrder(ctx context.Context, e *sdk.OrderEvent) error {
 	d := e.Order.Delivery
 	if d.Handler != pluginName+"/door" && d.Handler != pluginName+"/point" {
@@ -346,16 +384,29 @@ func onOrder(ctx context.Context, e *sdk.OrderEvent) error {
 	if uuid == "" && !wantCreate(e, d.Settings) {
 		return nil
 	}
+	won, err := claim(ctx, e.Order.ID)
+	if err != nil {
+		return err
+	}
+	if !won {
+		return nil // другой процесс уже создаёт это отправление
+	}
+	defer release(ctx, e.Order.ID)
+
 	uuid, number, err = ensure(ctx, e, uuid)
+	if err != nil && !isPermanent(err) {
+		_ = save(ctx, e.Order.ID, uuid, number, err.Error())
+		return err
+	}
 	msg := ""
 	if err != nil {
-		msg = err.Error()
+		msg = permanentText(err)
 	}
 	if saveErr := save(ctx, e.Order.ID, uuid, number, msg); saveErr != nil {
 		return saveErr
 	}
 	if err != nil {
-		return err
+		return nil // отказ записан, очередь идёт дальше
 	}
 	if number == "" {
 		// Повтор того же события спросит номер ещё раз: СДЭК присваивает его не сразу.
@@ -367,9 +418,32 @@ func onOrder(ctx context.Context, e *sdk.OrderEvent) error {
 func wantCreate(e *sdk.OrderEvent, s map[string]string) bool {
 	code := strings.TrimSpace(s["on_status"])
 	if code != "" {
+		// При оформлении ядро шлёт created, а не status. «new» иначе никогда не сработает.
+		if code == "new" && e.Kind == sdk.OrderCreated {
+			return true
+		}
 		return e.Kind == sdk.OrderStatus && e.Status == code
 	}
 	return e.Kind == sdk.OrderPaid || (e.Kind == sdk.OrderStatus && e.Status == "paid")
+}
+
+// claim занимает строку на 15 минут: второй процесс движка на той же базе
+// не пошлёт свой POST, пока первый не закончит или срок не выйдет.
+func claim(ctx context.Context, order int64) (bool, error) {
+	if err := db.Exec(ctx, `insert into cdek_orders (order_id) values ($1) on conflict do nothing`, order); err != nil {
+		return false, err
+	}
+	rows, err := db.Query(ctx, `update cdek_orders set claimed_at = now()
+		where order_id = $1 and (claimed_at is null or claimed_at < now() - interval '15 minutes')
+		returning order_id`, order)
+	if err != nil {
+		return false, err
+	}
+	return len(rows) > 0, nil
+}
+
+func release(ctx context.Context, order int64) {
+	_ = db.Exec(ctx, `update cdek_orders set claimed_at = null where order_id = $1`, order)
 }
 
 func load(ctx context.Context, order int64) (uuid, number string, err error) {
@@ -406,6 +480,9 @@ func ensure(ctx context.Context, e *sdk.OrderEvent, uuid string) (string, string
 			if findErr == nil && (u != "" || n != "") {
 				return u, n, nil
 			}
+			if findErr != nil && !isPermanent(findErr) {
+				return "", "", findErr
+			}
 			return "", "", errCreate
 		}
 	}
@@ -423,7 +500,7 @@ func ensure(ctx context.Context, e *sdk.OrderEvent, uuid string) (string, string
 		if msg == "" {
 			msg = "СДЭК отклонил заказ"
 		}
-		return uuid, "", errors.New(msg)
+		return uuid, "", permanent(msg)
 	}
 	return uuid, n, nil
 }
@@ -441,7 +518,7 @@ func findByNumber(ctx context.Context, s map[string]string, im string) (string, 
 	}
 	u, n, state, msg, _ := readOrder(v)
 	if state == "INVALID" {
-		return "", "", errors.New(first(msg, "СДЭК отклонил заказ"))
+		return "", "", permanent(first(msg, "СДЭК отклонил заказ"))
 	}
 	return u, n, nil
 }
@@ -493,15 +570,18 @@ func create(ctx context.Context, e *sdk.OrderEvent) (string, error) {
 	point := strings.HasSuffix(o.Delivery.Handler, "/point")
 	from, err := cityCode(ctx, s, s["from_city"], nil)
 	if err != nil {
+		if errors.Is(err, errNoCity) {
+			return "", permanent("Город отправки СДЭК не нашёл")
+		}
 		return "", err
 	}
 	phone := normalizePhone(s["sender_phone"])
 	if strings.TrimSpace(s["sender_name"]) == "" || phone == "" {
-		return "", errors.New("В настройках СДЭК не заполнены отправитель и его телефон")
+		return "", permanent("В настройках СДЭК не заполнены отправитель и его телефон")
 	}
 	toPhone := normalizePhone(o.Phone)
 	if toPhone == "" {
-		return "", errors.New("В заказе нет телефона — СДЭК без него заказ не примет")
+		return "", permanent("В заказе нет телефона — СДЭК без него заказ не примет")
 	}
 	body := map[string]any{
 		"type":        1,
@@ -528,6 +608,9 @@ func create(ctx context.Context, e *sdk.OrderEvent) (string, error) {
 	} else {
 		to, err := cityCode(ctx, s, o.Delivery.Place.Name, o.Delivery.Place.Path)
 		if err != nil {
+			if errors.Is(err, errNoCity) {
+				return "", permanent("Город получателя СДЭК не нашёл")
+			}
 			return "", err
 		}
 		toLoc := map[string]any{"code": to}
@@ -546,7 +629,13 @@ func create(ctx context.Context, e *sdk.OrderEvent) (string, error) {
 	}
 	u, _, state, msg, _ := readOrder(v)
 	if code >= 400 || state == "INVALID" || u == "" {
-		return "", errors.New(first(msg, "СДЭК не принял заказ, код "+strconv.Itoa(code)))
+		text := first(msg, "СДЭК не принял заказ, код "+strconv.Itoa(code))
+		// Пустой ответ на 2xx — обрыв: заказ мог создаться, его найдут по номеру.
+		// 5xx и 401 — временные. Остальной отказ повтор не исправит.
+		if u == "" && code < 400 || code == http.StatusUnauthorized || code == http.StatusRequestTimeout || code == http.StatusTooManyRequests || code >= 500 {
+			return "", errors.New(text)
+		}
+		return "", permanent(text)
 	}
 	return u, nil
 }
